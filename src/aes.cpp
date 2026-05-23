@@ -4,7 +4,6 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
-#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -98,12 +97,14 @@ std::string compute_aes(const std::string& plaintext,
     EVP_CIPHER_CTX_free(ctx);
 
     // Step 5: HMAC-SHA256 over ciphertext using mac_key
-    unsigned char hmac_buf[32];
-    unsigned int  hmac_len = 0;
-    HMAC(EVP_sha256(),
+    unsigned char hmac_buf[EVP_MAX_MD_SIZE];
+    unsigned int hmac_len = 0;
+    unsigned char* hmac_ret = HMAC(EVP_sha256(),
          mac_key, 32,
          ciphertext.data(), static_cast<int>(ciphertext_len),
          hmac_buf, &hmac_len);
+
+    if (!hmac_ret || hmac_len == 0) return "ERROR_HMAC";
 
     // format: ciphertext_hex:hmac_hex
     return to_hex(ciphertext.data(), ciphertext_len) + ":" +
