@@ -240,9 +240,16 @@ int run_tmrnode(int argc, char* argv[]) {
         std::cerr << "[錯誤] 請設定環境變數 AES_MASTER_KEY（64 hex chars）\n";
         return 1;
     }
-    for (int i = 0; i < 32; i++)
-        sscanf(env_key + i * 2, "%02hhx", &master_key[i]);
-
+    if (strlen(env_key) != 64) {
+        std::cerr << "[錯誤] AES_MASTER_KEY 必須是 64 個 hex 字元，目前長度：" << strlen(env_key) << "\n";
+        return 1;
+    }
+    for (int i = 0; i < 32; i++) {
+        if (sscanf(env_key + i * 2, "%02hhx", &master_key[i]) != 1) {
+            std::cerr << "[錯誤] AES_MASTER_KEY 包含非法字元，位置：" << i * 2 << "\n";
+            return 1;
+        }
+    }
     std::map<std::string, std::string> cluster_ips = {
         {"A", "192.168.50.41"},
         {"B", "192.168.50.14"},
