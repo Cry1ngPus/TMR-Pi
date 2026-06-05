@@ -14,11 +14,14 @@
 #include <atomic>
 #include <random>
 #include <cstdlib>
+#include <fstream>
 #include "aes.h"
 
 #define PORT 8888
 
 // ================= 全域 =================
+std::ofstream log_file;
+std::mutex log_mtx; // [修正] 專為 Log 與 cout 設計的互斥鎖，避免多執行緒寫入撕裂
 std::string my_id;
 std::vector<std::string> peer_ips;
 std::atomic<bool> inject_fault(false);
@@ -64,6 +67,16 @@ void broadcast(const std::string& msg) {
 
 // ================= Vote =================
 void vote(const std::string& task_id) {
+    // 實作安全日誌輸出的 Lambda 函式
+    auto log = [&](const std::string& msg) {
+        std::lock_guard<std::mutex> lock(log_mtx); // 確保多個 task 的 vote 不會互相踩踏輸出
+        std::cout << msg;
+        if (log_file.is_open()) {
+            log_file << msg;
+            log_file.flush(); // 強制落碟，防止節點崩潰時丟失最新日誌
+        }
+    };
+
     std::lock_guard<std::mutex> lock(mtx);
     auto &task = tasks[task_id];
 
@@ -88,7 +101,7 @@ void vote(const std::string& task_id) {
         } else {
             // 驗證失敗：HMAC 對不上，代表資料遭變更
             tampered_count++;
-            std::cout << "偵測到來自節點 " << node_id << " 的封包遭到竄改！已強制剔除該票。\n";
+            log("偵測到來自節點 " + node_id + " 的封包遭到竄改！已強制剔除該票。\n");
         }
     }
 
@@ -104,43 +117,43 @@ void vote(const std::string& task_id) {
 
     int expected_nodes = 1 + peer_ips.size(); // 預期要有 3 台
 
-    std::cout << "\n=== Task " << task_id << " 投票結果 ===\n";
+    log("\n=== Task " + task_id + " 投票結果 ===\n");
 
     if (expected_nodes == 3) {
         
         // 【情況一】：無斷線、無竄改
         if (missing_count == 0 && tampered_count == 0) {
             if (max_count >= 2)
-                std::cout << "[成功] 3TMR 多數決成功 (" << max_count << "/3)\n";
+                log("[成功] 3TMR 多數決成功 (" + std::to_string(max_count) + "/3)\n");
             else
-                std::cout << "[失敗] 3TMR 投票分歧，無法達成一致\n";
+                log("[失敗] 3TMR 投票分歧，無法達成一致\n");
         }
         
         // 【情況二】：單純的節點缺失 (1 台斷線/逾時，但沒人被竄改) -> 正常降級 2MR
         else if (missing_count == 1 && tampered_count == 0) {
             if (max_count == 2)
-                std::cout << "[降級成功] 2MR 一致 (因「節點缺失/網路斷線」啟動降級機制)\n";
+                log("[降級成功] 2MR 一致 (因「節點缺失/網路斷線」啟動降級機制)\n");
             else
-                std::cout << "[降級失敗] 2MR 分歧 (因「節點缺失/網路斷線」啟動降級機制)\n";
+                log("[降級失敗] 2MR 分歧 (因「節點缺失/網路斷線」啟動降級機制)\n");
         }
         
         // 【情況三】：遭到惡意竄改 (只有 1 台被竄改)
         else if (missing_count == 0 && tampered_count == 1) {
-            std::cout << "[資安防禦] 警告：偵測到 1 個節點遭受竄改攻擊！排除惡意資料，強制啟動 2MR 安全審查...\n";
+            log("[資安防禦] 警告：偵測到 1 個節點遭受竄改攻擊！排除惡意資料，強制啟動 2MR 安全審查...\n");
             if (max_count == 2)
-                std::cout << "[防禦成功] 排除被竄改資料後，其餘 2 個合法節點資料完全一致，安全通過！\n";
+                log("[防禦成功] 排除被竄改資料後，其餘 2 個合法節點資料完全一致，安全通過！\n");
             else
-                std::cout << "[防禦失敗] 排除被竄改資料後，其餘 2 個合法節點資料分歧，拒絕採信！\n";
+                log("[防禦失敗] 排除被竄改資料後，其餘 2 個合法節點資料分歧，拒絕採信！\n");
         }
         
         // 【情況四】：多個節點遭到變更/竄改
         else if (tampered_count >= 2) {
-            std::cout << "[嚴重攻擊中止] 偵測到多個節點(" << tampered_count << "個)同時遭到竄改！系統遭受威脅，拒絕降級，終止本次投票！\n";
+            log("[嚴重攻擊中止] 偵測到多個節點(" + std::to_string(tampered_count) + "個)同時遭到竄改！系統遭受威脅，拒絕降級，終止本次投票！\n");
         }
         
         // 【情況五】：1台斷線，同時又有1台被竄改
         else {
-            std::cout << "[嚴重錯誤] 同時發生「節點缺失」與「資料竄改」，剩餘合法節點不足，無法完成投票！\n";
+            log("[嚴重錯誤] 同時發生「節點缺失」與「資料竄改」，剩餘合法節點不足，無法完成投票！\n");
         }
     }
     
@@ -148,27 +161,33 @@ void vote(const std::string& task_id) {
     else if (expected_nodes == 2) {
         int received_nodes = 1 + task.peer_results.size() - tampered_count;
         if (received_nodes == 2 && max_count == 2)
-            std::cout << "[成功] 2MR 一致\n";
+            log("[成功] 2MR 一致\n");
         else
-            std::cout << "[失敗] 2MR 分歧、節點缺失或資料遭竄改\n";
+            log("[失敗] 2MR 分歧、節點缺失或資料遭竄改\n");
     }
     else {
-        std::cout << "[錯誤] 不支援的節點數\n";
+        log("[錯誤] 不支援的節點數\n");
     }
 
-    std::cout << "===========================\n> ";
+    log("===========================\n> ");
     fflush(stdout);
 }
 
 // ================= Task Processing =================
 void process_task(const std::string& task_id, const std::string& plaintext) {
-    std::cout << "\n[任務啟動] ID: " << task_id << " | 內容: " << plaintext << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(log_mtx);
+        std::cout << "\n[任務啟動] ID: " << task_id << " | 內容: " << plaintext << std::endl;
+        if (log_file.is_open()) log_file << "\n[任務啟動] ID: " << task_id << " | 內容: " << plaintext << std::endl;
+    }
 
     std::string text_to_encrypt = plaintext;
 
     if (inject_fault.load()) {
         text_to_encrypt += "_WRONG"; 
+        std::lock_guard<std::mutex> lock(log_mtx);
         std::cout << "[警告] 模擬節點運算錯誤 (Fault)\n";
+        if (log_file.is_open()) log_file << "[警告] 模擬節點運算錯誤 (Fault)\n";
     }
     std::string my_cipher = compute_aes(text_to_encrypt, master_key, task_id);
 
@@ -189,17 +208,23 @@ void process_task(const std::string& task_id, const std::string& plaintext) {
             return task.peer_results.size() >= peer_ips.size();
         });
 
-    if (!success)
-        std::cout << "[逾時] 未收齊，降級投票\n";
-    else
-        std::cout << "[收齊] 所有結果\n";
+    {
+        std::lock_guard<std::mutex> log_lock(log_mtx);
+        if (!success) {
+            std::cout << "[逾時] 未收齊，降級投票\n";
+            if (log_file.is_open()) log_file << "[逾時] 未收齊，降級投票\n";
+        } else {
+            std::cout << "[收齊] 所有結果\n";
+            if (log_file.is_open()) log_file << "[收齊] 所有結果\n";
+        }
+    }
 
     lock.unlock();
-
     vote(task_id);
-
-    lock.lock();
-    task.finished = true;
+    {
+        std::lock_guard<std::mutex> g(mtx);
+        tasks[task_id].finished = true;
+    }
 }
 
 // ================= Listener =================
@@ -261,22 +286,28 @@ void listener_thread() {
 
             {
                 std::lock_guard<std::mutex> lock(mtx);
-                auto &t = tasks[task_id];
-                t.peer_results[node_id] = cipher;
-                task_ptr = &t;
+                tasks[task_id].peer_results[node_id] = cipher;
+                tasks[task_id].cv.notify_one(); // ← 在鎖內 notify
             }
-
-            task_ptr->cv.notify_one();
         }
     }
 }
 
 int run_tmrnode(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "用法: ./TMR-Pi A/B/C\n"; // 建議改用 std::cerr 輸出錯誤訊息
+        return 1;
+    }
+
+    my_id = argv[1]; 
+    log_file.open("tmr_" + my_id + ".log", std::ios::app);
+
     const char* env_key = std::getenv("AES_MASTER_KEY");
     if (!env_key) {
         std::cerr << "[錯誤] 請設定環境變數 AES_MASTER_KEY（64 hex chars）\n";
         return 1;
     }
+
     if (strlen(env_key) != 64) {
         std::cerr << "[錯誤] AES_MASTER_KEY 必須是 64 個 hex 字元，目前長度：" << strlen(env_key) << "\n";
         return 1;
@@ -293,31 +324,34 @@ int run_tmrnode(int argc, char* argv[]) {
         {"C", "192.168.50.62"}
     };
 
-    if (argc < 2) {
-        std::cout << "用法: ./TMR-Pi A/B/C\n";
-        return 1;
-    }
-
-    my_id = argv[1];
-
     for (auto &n : cluster_ips) {
         if (n.first != my_id)
             peer_ips.push_back(n.second);
     }
 
-    std::cout << "啟動節點 " << my_id << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(log_mtx);
+        std::cout << "啟動節點 " << my_id << std::endl;
+        if (log_file.is_open()) log_file << "啟動節點 " << my_id << std::endl;
+    }
 
     std::thread(listener_thread).detach();
 
     std::string input;
 
     while (true) {
-        std::cout << "\n> ";
+        {
+            std::lock_guard<std::mutex> lock(log_mtx);
+            std::cout << "\n> ";
+            std::cout.flush();
+        }
         std::getline(std::cin, input);
 
         if (input == "fault") {
             inject_fault.store(!inject_fault.load());
+            std::lock_guard<std::mutex> lock(log_mtx);
             std::cout << "fault: " << inject_fault.load() << std::endl;
+            if (log_file.is_open()) log_file << "fault: " << inject_fault.load() << std::endl;
         }
         else if (!input.empty()) {
             std::string task_id = gen_task_id();
