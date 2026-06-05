@@ -48,6 +48,15 @@ void safe_log(const std::string& msg) {
     }
 }
 
+// Heartbeat 專用變數與全域叢集配置
+std::map<std::string, std::string> cluster_ips = {
+    {"A", "192.168.50.41"},
+    {"B", "192.168.50.14"},
+    {"C", "192.168.50.62"}
+};
+std::map<std::string, std::chrono::steady_clock::time_point> last_seen;
+std::mutex hb_mtx;
+
 // task id 
 std::string gen_task_id() {
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -237,6 +246,14 @@ void process_task(const std::string& task_id, const std::string& plaintext) {
     }
 }
 
+// ================= Heartbeat =================
+void heartbeat_thread() {
+    while (true) {
+        broadcast("PING:" + my_id);
+        std::this_thread::sleep_for(std::chrono::seconds(5)); // 每 5 秒發送一次心跳
+    }
+}
+
 // ================= Listener =================
 void listener_thread() {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -292,16 +309,20 @@ void listener_thread() {
             std::string node_id = msg.substr(p1 + 1, p2 - p1 - 1);
             std::string cipher = msg.substr(p2 + 1);
 
-            TaskState* task_ptr = nullptr;
-
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 tasks[task_id].peer_results[node_id] = cipher;
                 tasks[task_id].cv.notify_one();
             }
         }
-    }
-}
+        // ===== PING (Heartbeat 攔截) =====
+        else if (msg.rfind("PING:", 0) == 0) {
+            std::string source_id = msg.substr(5);
+            std::lock_guard<std::mutex> lock(hb_mtx);
+            last_seen[source_id] = std::chrono::steady_clock::now();
+        }
+    } // end of while(true)
+} // end of listener_thread
 
 int run_tmrnode(int argc, char* argv[]) {
     if (argc < 2) {
@@ -328,11 +349,6 @@ int run_tmrnode(int argc, char* argv[]) {
             return 1;
         }
     }
-    std::map<std::string, std::string> cluster_ips = {
-        {"A", "192.168.50.41"},
-        {"B", "192.168.50.14"},
-        {"C", "192.168.50.62"}
-    };
 
     for (auto &n : cluster_ips) {
         if (n.first != my_id)
@@ -346,6 +362,7 @@ int run_tmrnode(int argc, char* argv[]) {
     }
 
     std::thread(listener_thread).detach();
+    std::thread(heartbeat_thread).detach(); //啟動背景廣播
 
     std::string input;
 
@@ -370,11 +387,32 @@ int run_tmrnode(int argc, char* argv[]) {
         }
         else if (input == "status") {
             std::string output = "\n=== 節點狀態 ===\n";
-            output += "節點 ID   : " + my_id + "\n";
-            output += "Fault 模式: " + std::string(inject_fault.load() ? "ON (模擬錯誤)" : "OFF") + "\n";
+            output += "本機 ID   : " + my_id + "\n";
+            output += "Fault 模式: " + std::string(inject_fault.load() ? "ON (模擬錯誤)" : "OFF") + "\n\n";
 
             {
-                // 以最小化鎖定時間 (Lock Contention) 的原則讀取 tasks
+                std::lock_guard<std::mutex> hb_lock(hb_mtx);
+                auto now = std::chrono::steady_clock::now();
+                output += "--- 叢集連線狀態 (Heartbeat) ---\n";
+                for (const auto& node : cluster_ips) {
+                    if (node.first == my_id) continue;
+                    
+                    auto it = last_seen.find(node.first);
+                    if (it != last_seen.end()) {
+                        auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
+                        if (duration > 15) {
+                            output += "[斷線] 節點 " + node.first + " (逾時 " + std::to_string(duration) + " 秒未回應)\n";
+                        } else {
+                            output += "[在線] 節點 " + node.first + " (上次通訊: " + std::to_string(duration) + " 秒前)\n";
+                        }
+                    } else {
+                        output += "[未知] 節點 " + node.first + " (尚未建立連線)\n";
+                    }
+                }
+            }
+
+            output += "\n--- 任務佇列 ---\n";
+            {
                 std::lock_guard<std::mutex> lock(mtx);
                 output += "任務總數  : " + std::to_string(tasks.size()) + "\n";
                 for (const auto& [id, t] : tasks) {
@@ -383,9 +421,8 @@ int run_tmrnode(int argc, char* argv[]) {
                               "/" + std::to_string(peer_ips.size()) + "\n";
                 }
             }
-            
             output += "================\n";
-            safe_log(output); // 使用全域的 thread-safe 日誌函式一次性輸出
+            safe_log(output);
         }
     }
 }
